@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::Path;
 use semver::VersionReq;
 use semver::Version as SemVer;
 use std::sync::Arc;
@@ -117,17 +119,30 @@ impl Exploration {
         }
     }
 
-    fn fetch(client: &reqwest::Client, name: &str) -> Result<Vec<Crate>, BoxErr> {
+    fn fetch(client: &reqwest::Client, name: &str, etag: Option<&str>) -> Result<(Option<String>, Option<String>), BoxErr> {
         let url = crate_url(&name);
         eprintln!("Fetching {} from {}", name, url);
-        let mut res = client.get(&url).send()?.error_for_status()?;
-        let body = res.text()?;
-        let crate_versions = body.lines().map(|l| {
+        let req = client.get(&url);
+        let mut res = match etag {
+            Some(etag) => req.header("if-none-match", etag.trim_start_matches("W/")),
+            None => req,
+        }
+        .send()?
+        .error_for_status()?;
+        let etag = res.headers().get("etag").and_then(|s| s.to_str().ok()).map(|s| s.to_string());
+        if res.status() == 304 {
+            eprintln!("Revalidated {}", name);
+            return Ok((None, etag));
+        }
+        Ok((Some(res.text()?), etag))
+    }
+
+    fn parse(body: &str) -> Result<Vec<Crate>, BoxErr> {
+        Ok(body.lines().map(|l| {
             serde_json::from_str(l).map_err(|e| {
-                format!("{}; {} bodylen={}, while parsing {} from {}", e, url, body.len(), name, l)
+                format!("{}; bodylen={}, while parsing from {}", e, body.len(), l)
             })
-        }).collect::<Result<Vec<Crate>, _>>()?;
-        Ok(crate_versions)
+        }).collect::<Result<Vec<Crate>, _>>()?)
     }
 
     pub fn enqueue(&mut self, name: String, wants: LookupFeatures) -> Result<(), BoxErr> {
@@ -164,8 +179,38 @@ impl Exploration {
                 let name = name.clone();
                 let tx = self.sender.clone();
                 let client = self.client.clone();
+
+                let mut etag = None;
+                let cache_path = Path::new("cache").join(&name);
+                let mut cached = None;
+                if let Ok(body) = fs::read_to_string(&cache_path) {
+                    etag = fs::read_to_string(cache_path.with_extension("etag")).ok();
+                    let tmp = Self::parse(&body)?;
+                    // Speculatively process versions from cache
+                    self.process(&wants, &tmp)?;
+                    cached = Some(tmp);
+                }
+
                 std::thread::spawn(move || {
-                    tx.send(Self::fetch(&client, &name).map(|f| (name, f))).expect("send");
+                    tx.send(Self::fetch(&client, &name, etag.as_ref().map(|s| s.as_str()))
+                    .and_then(|(body, etag)| {
+                        Ok(if let Some(body) = body {
+                            let t = Self::parse(&body)?;
+                            // save only if parses
+                            fs::write(&cache_path, &body)?;
+                            let cache_path_etag = cache_path.with_extension("etag");
+                            if let Some(etag) = etag {
+                                fs::write(cache_path_etag, etag)?;
+                            } else {
+                                let _ = fs::remove_file(cache_path_etag);
+                            }
+                            t
+                        } else {
+                            cached.ok_or("unexpected revalidation")?
+                        })
+                    })
+                    .map(|f| (name, f)))
+                    .expect("send");
                 });
             },
         }
@@ -247,6 +292,7 @@ impl Exploration {
 }
 
 fn main() -> Result<(), BoxErr> {
+    fs::create_dir_all("cache")?;
     let mut e = Exploration::new();
 
     let start = std::time::Instant::now();
