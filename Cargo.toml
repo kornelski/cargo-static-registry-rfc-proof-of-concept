@@ -1,0 +1,18 @@
+[package]
+name = "cargo-static-registry-rfc-proof-of-concept"
+description = "Testing whether it's feasible to serve crates-io registry over HTTP as static files"
+homepage = "https://github.com/rust-lang/rfcs/pull/2789"
+license = "CC0-1.0"
+version = "0.1.0"
+authors = ["Kornel <kornel@geekhood.net>"]
+edition = "2018"
+readme = "README.md"
+
+[dependencies]
+serde_json = "1.0.44"
+serde = "1.0.103"
+serde_derive = "1.0.103"
+reqwest = { version = "0.9.22", features = ["rustls-tls"] }
+semver-parser = "0.9.0"
+semver = "0.9.0"
+
